@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ============================================================
 WORKFLOW OF THE UNIFIED SCRIPT
@@ -8,8 +10,8 @@ WORKFLOW OF THE UNIFIED SCRIPT
    - Converts ENSP IDs to Entrez Gene IDs using MyGene.
 
 2. SEED GENES READING:
-   - Reads seed genes from the 'genes_seed.txt' file.
-   - Converts any HUGO symbols to Entrez Gene IDs.
+   - Reads seed genes from the file.
+   - Converts HUGO symbols to Entrez Gene IDs.
 
 3. GRAPH CONSTRUCTION:
    - Builds a NetworkX graph with nodes representing genes and edges representing STRING interactions.
@@ -17,43 +19,54 @@ WORKFLOW OF THE UNIFIED SCRIPT
 
 4. CHECK SEED GENE PRESENCE:
    - Checks which seed genes are present in the network.
-   - If none of the seed genes are present, the script stops.
 
 5. ALGORITHMS EXECUTION:
    a) DIAMOnD:
-      - Adds nodes to the network based on statistical proximity to seed genes using the hypergeometric test.
-      - Saves the results in 'diamond_results.csv'.
+      - Adds nodes to the network based on proximity to seed genes using hypergeometric test.
    b) GUILD NetScore:
-      - Calculates a score for all nodes by propagating information from seed genes to neighbors.
-      - Saves the results in 'guild_results.csv'.
+      - Calculates a score for all nodes propagating information from seed genes.
 
-6. OUTPUT:
-   - All output files are saved in the 'results' folder.
-   - Node IDs in the results are in Entrez Gene ID format.
+6. SELECT TOP NODES:
+   - Selects top nodes from DIAMOnD and GUILD for functional analysis.
+
+7. FUNCTIONAL ENRICHMENT:
+   - Converts Entrez IDs to HUGO symbols.
+   - Uses Enrichr API to perform ORA on top nodes.
+   - Generates bar plots for top terms.
+
+8. OUTPUT:
+   - All output files and plots are saved in the output folder.
 ============================================================
 """
 
 import os
+import argparse
 import pandas as pd
 import mygene
-from tqdm import tqdm
 import networkx as nx
 from scipy.stats import hypergeom
+from tqdm import tqdm
+import requests
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # ==============================
-# PATH CONFIGURATION
+# CLI ARGUMENTS
 # ==============================
-base_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.join(base_dir, '..', 'data')
-results_dir = os.path.join(base_dir, '..', 'results')
+parser = argparse.ArgumentParser(description="STRING network + DIAMOnD + GUILD + Functional Analysis")
+parser.add_argument("--string_input", type=str, required=True, help="Path to raw STRING network file")
+parser.add_argument("--seed_genes", type=str, required=True, help="Path to seed genes file")
+parser.add_argument("--output_dir", type=str, default="../results", help="Folder to save results")
+parser.add_argument("--top_n", type=int, default=10, help="Number of top nodes to select for functional analysis")
+args = parser.parse_args()
 
-if not os.path.exists(results_dir):
-    os.makedirs(results_dir)
+string_raw_file = args.string_input
+genes_seed_file = args.seed_genes
+results_dir = args.output_dir
+TOP_N = args.top_n
+os.makedirs(results_dir, exist_ok=True)
 
-# Input files
-string_raw_file = os.path.join(data_dir, '9606.protein.links.v12.0.txt')
-genes_seed_file = os.path.join(data_dir, 'genes_seed.txt')
-string_entrez_file = os.path.join(results_dir, 'string12_9606_800_entrez.txt')
+string_entrez_file = os.path.join(results_dir, 'string_filtered_entrez.txt')
 
 # ==============================
 # STRING FILTERING AND ENTREZ CONVERSION
@@ -101,7 +114,7 @@ print(f"Filtered STRING network saved to '{string_entrez_file}'")
 # ==============================
 with open(genes_seed_file, 'r') as f:
     seed_genes = [g.strip() for g in f.read().splitlines()]
-print("Seed genes read from 'genes_seed.txt':", seed_genes)
+print("Seed genes read:", seed_genes)
 
 res = mg.querymany(seed_genes, scopes='symbol', fields='entrezgene', species='human')
 seed_entrez = [str(r['entrezgene']) for r in res if 'entrezgene' in r]
@@ -125,6 +138,9 @@ print(f"STRING network loaded with {G_string.number_of_nodes()} nodes and {G_str
 # ALGORITHM FUNCTIONS
 # ==============================
 def diamond_algorithm(G, seed_genes, num_nodes=10):
+    """
+    DIAMOnD algorithm: iteratively adds nodes statistically close to seed genes using hypergeometric test.
+    """
     added_nodes = []
     all_nodes = set(G.nodes())
     seed_set = set(seed_genes)
@@ -149,6 +165,9 @@ def diamond_algorithm(G, seed_genes, num_nodes=10):
     return added_nodes
 
 def guild_netscore(G, seed_genes, max_iter=5):
+    """
+    GUILD NetScore: propagates scores from seed genes through neighbors to rank all nodes.
+    """
     score = {n: 0.0 for n in G.nodes()}
     for g in seed_genes:
         if g in score:
@@ -169,8 +188,7 @@ def guild_netscore(G, seed_genes, max_iter=5):
 # ==============================
 present = [g for g in seed_entrez if g in G_string.nodes()]
 missing = [g for g in seed_entrez if g not in G_string.nodes()]
-
-print(f"\nSeed genes present in the network: {len(present)}, missing: {len(missing)}")
+print(f"\nSeed genes present: {len(present)}, missing: {len(missing)}")
 if missing:
     print("Missing:", missing)
 if len(present) == 0:
@@ -179,17 +197,119 @@ if len(present) == 0:
 # ==============================
 # ALGORITHM EXECUTION
 # ==============================
-diamond_results = diamond_algorithm(G_string, present, num_nodes=10)
-diamond_out = pd.DataFrame(diamond_results, columns=['node', 'p_value'])
-diamond_out.to_csv(os.path.join(results_dir, 'diamond_results.csv'), index=False)
+diamond_results = diamond_algorithm(G_string, present, num_nodes=TOP_N)
+diamond_out_file = os.path.join(results_dir, 'diamond_results.csv')
+pd.DataFrame(diamond_results, columns=['node', 'p_value']).to_csv(diamond_out_file, index=False)
+print(f"DIAMOnD results saved to '{diamond_out_file}'")
 
 guild_scores = guild_netscore(G_string, present)
-guild_out = pd.DataFrame(sorted(guild_scores.items(), key=lambda x: x[1], reverse=True),
-                         columns=['node', 'score'])
-guild_out.to_csv(os.path.join(results_dir, 'guild_results.csv'), index=False)
+guild_out_file = os.path.join(results_dir, 'guild_results.csv')
+pd.DataFrame(sorted(guild_scores.items(), key=lambda x: x[1], reverse=True),
+             columns=['node', 'score']).to_csv(guild_out_file, index=False)
+print(f"GUILD NetScore results saved to '{guild_out_file}'")
 
-top10 = guild_out.head(10)
-print("\nTop 10 GUILD NetScore nodes:")
-for _, row in top10.iterrows():
-    print(f"{row['node']} {row['score']:.3f}")
+# ==============================
+# SELECT TOP NODES FOR FUNCTIONAL ANALYSIS
+# ==============================
+diamond_df = pd.read_csv(diamond_out_file)
+top_diamond_nodes = diamond_df.nsmallest(TOP_N, 'p_value')['node'].astype(str).tolist()
 
+guild_df = pd.read_csv(guild_out_file)
+top_guild_nodes = guild_df.nlargest(TOP_N, 'score')['node'].astype(str).tolist()
+
+overlap_nodes = list(set(top_diamond_nodes) & set(top_guild_nodes))
+print(f"\nOverlap top {TOP_N} nodes DIAMOnD vs GUILD: {len(overlap_nodes)}")
+if overlap_nodes:
+    print(overlap_nodes)
+
+# Combine top nodes
+nodes_for_functional = list(set(top_diamond_nodes + top_guild_nodes))
+
+# ==============================
+# MAP ENTIRE LIST OF NODES TO HUGO SYMBOLS FOR FUNCTIONAL ANALYSIS
+# ==============================
+def entrez_to_symbol(entrez_ids: list[str]) -> list[str]:
+    """
+    Convert a list of Entrez IDs to HUGO symbols using MyGene.
+    Only returns genes that are successfully mapped.
+    """
+    batch_size = 1000
+    symbols = []
+    for i in range(0, len(entrez_ids), batch_size):
+        batch = entrez_ids[i:i+batch_size]
+        results = mg.getgenes(batch, fields='symbol', species='human')
+        for res in results:
+            if 'symbol' in res:
+                symbols.append(res['symbol'])
+    return symbols
+
+nodes_for_functional_symbols = entrez_to_symbol(nodes_for_functional)
+print(f"\nMapped {len(nodes_for_functional_symbols)} nodes to HUGO symbols for functional enrichment.")
+
+functional_input_file = os.path.join(results_dir, "nodes_for_functional.txt")
+with open(functional_input_file, "w") as f:
+    for gene in nodes_for_functional_symbols:
+        f.write(f"{gene}\n")
+print(f"Nodes for functional analysis saved to '{functional_input_file}'")
+
+
+# ==============================
+# FUNCTIONAL ENRICHMENT
+# ==============================
+def enrichr_analysis(genes: list[str], libraries: list[str]) -> dict:
+    """
+    Submit genes to Enrichr API and fetch top enriched terms.
+    """
+    add_list_url = "https://maayanlab.cloud/Enrichr/addList"
+    enrich_url = "https://maayanlab.cloud/Enrichr/enrich"
+    gene_str = "\n".join(genes)
+    payload = {'list': (None, gene_str), 'description': (None, 'Functional analysis')}
+    response = requests.post(add_list_url, files=payload)
+    if response.status_code != 200:
+        raise RuntimeError("Error submitting gene list to Enrichr.")
+    user_list_id = response.json()['userListId']
+    enrichment_results = {}
+    for lib in libraries:
+        params = {'userListId': user_list_id, 'backgroundType': lib}
+        enrich_response = requests.get(enrich_url, params=params)
+        if enrich_response.status_code != 200:
+            print(f"Error retrieving enrichment results for {lib}")
+            continue
+        results = enrich_response.json()
+        if lib not in results:
+            continue
+        enrichment_results[lib] = results[lib][:5]
+    return enrichment_results
+
+def plot_enrichment(enrichment_results: dict, out_dir: str) -> None:
+    """
+    Create barplots for enrichment results.
+    """
+    sns.set(style="whitegrid")
+    for lib, terms_data in enrichment_results.items():
+        if not terms_data:
+            continue
+        terms = [entry[1] for entry in terms_data]
+        scores = [entry[4] for entry in terms_data]
+        plt.figure(figsize=(8, 5))
+        sns.barplot(x=scores, y=terms, palette="viridis")
+        plt.xlabel("Combined Score")
+        plt.ylabel("Term")
+        plt.title(f"Top 5 Enriched Terms: {lib}")
+        plt.tight_layout()
+        plot_filename = f"top5_{lib.replace(' ', '_')}.png"
+        plot_path = os.path.join(out_dir, plot_filename)
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"Saved barplot for {lib} to '{plot_path}'")
+
+print("\nPerforming functional enrichment on top nodes...")
+libraries = [
+    'KEGG_2021_Human',
+    'GO_Biological_Process_2023',
+    'GO_Molecular_Function_2023',
+    'GO_Cellular_Component_2023'
+]
+functional_results = enrichr_analysis(nodes_for_functional_symbols, libraries)
+plot_enrichment(functional_results, results_dir)
+print("Functional analysis completed successfully.")
